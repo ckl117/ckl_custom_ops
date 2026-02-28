@@ -1,90 +1,85 @@
 import os
-import glob
-import torch
-from setuptools import setup
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+import subprocess
+from pathlib import Path
 
-library_name = "ckl_custom_ops"
-debug_mode = os.getenv("DEBUG", "0") == "1"
-if debug_mode:
-    print("Compiling in debug mode")
+from packaging.version import Version, parse
+from setuptools import find_packages, setup
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
-extra_link_args = []
-extra_compile_args = {
-    "cxx": [
-        "-O3" if not debug_mode else "-O0",
-        # "-fdiagnostics-color=always",
-        # "-DPy_LIMITED_API=0x03090000",  # min CPython version 3.9
-    ],
-    
-    "nvcc": [
-        "-O3" if not debug_mode else "-O0",
-        '-std=c++17',
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        '--expt-relaxed-constexpr',
-        "--expt-extended-lambda"
-        # "-DNDEBUG"
-        # "-Xcompiler",
-        # "-fPIC",
-        # '-gencode=arch=compute_100,code=sm_100',
-        # "-gencode=arch=compute_90,code=sm_90"
-        # "-DFLASHINFER_ENABLE_F16",
-        # "-DCUTE_USE_PACKED_TUPLE=1",
-        # "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
-        # "-DCUTLASS_VERSIONS_GENERATED",
-        # "-DCUTLASS_TEST_LEVEL=0",
-        # "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
-        # "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
-        # "--expt-relaxed-constexpr",
-        # "--expt-extended-lambda",
-        # '-gencode=arch=compute_80,code=sm_80',
-        # '-U__CUDA_NO_HALF_OPERATORS__',
-        # '-U__CUDA_NO_HALF_CONVERSIONS__',
-        # '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
-        # '-U__CUDA_NO_HALF2_OPERATORS__',
-    ],
-}
-if debug_mode:
-    extra_compile_args["cxx"].append("-g")
-    extra_compile_args["nvcc"].append("-g")
-    extra_link_args.extend(["-O0", "-g"])
+from tools.utils import get_build_cuda_cflags, get_build_sources
 
-this_dir = os.path.curdir
-abs_this_dir = os.path.abspath(this_dir)
-extensions_dir = os.path.join(this_dir, "csrc")
-include_dirs = [
-    'include',
-    'third_party/cutlass/include',
-]
-for i in range(len(include_dirs)):
-    include_dirs[i] = os.path.join(abs_this_dir, include_dirs[i])
+# package name managed by pip, which can be remove by `pip uninstall toy-hgemm`
+PACKAGE_NAME = "toy-hgemm"
 
-sources = []
-# sources = list(glob.glob(os.path.join(extensions_dir, "*.cc")))
-# cuda_sources = list(glob.glob(os.path.join(extensions_dir, "*.cu"))
-# sources = sources + cuda_sources
-sources += [
-    f'{extensions_dir}/common_extension.cc',
-    # f'{extensions_dir}/add/custom_add_kernel.cu',
-    f'{extensions_dir}/gemm/gemm.cu',
-]
-print(f'sources={sources}')
+ext_modules = []
+generator_flag = []
+cc_flag = []
+cc_flag.append("-gencode")
+cc_flag.append("arch=compute_80,code=sm_80")
+cc_flag.append("-gencode")
+cc_flag.append("arch=compute_89,code=sm_89")
+
+
+# helper function to get cuda version
+def get_cuda_bare_metal_version(cuda_dir):
+    raw_output = subprocess.check_output(
+        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
+    )
+    output = raw_output.split()
+    release_idx = output.index("release") + 1
+    bare_metal_version = parse(output[release_idx].split(",")[0])
+
+    return raw_output, bare_metal_version
+
+
+if CUDA_HOME is not None:
+    _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+    if bare_metal_version >= Version("11.8"):
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_90,code=sm_90")
+
+# ninja build does not work unless include_dirs are abs path
+this_dir = os.path.dirname(os.path.abspath(__file__))
+
+# cuda module
+# may need export LD_LIBRARY_PATH=PATH-TO/torch/lib:$LD_LIBRARY_PATH
+ext_modules.append(
+    CUDAExtension(
+        # package name for import
+        name="toy_hgemm",
+        sources=get_build_sources(),
+        extra_compile_args={
+            # add c compile flags
+            "cxx": ["-O3", "-std=c++17"] + generator_flag,
+            # add nvcc compile flags
+            "nvcc": get_build_cuda_cflags(build_pkg=True) + generator_flag + cc_flag,
+        },
+        include_dirs=[
+            Path(this_dir) / "csrc",
+            Path(this_dir) / "include",
+            Path(this_dir) / "third_party/cutlass/include",
+        ],
+    )
+)
 
 setup(
-    name=library_name,
-    ext_modules=[
-        CUDAExtension(
-            name=library_name,                # 模块名，Python import 时使用
-            include_dirs=include_dirs,
-            sources=sources, # CUDA 源文件
-            extra_compile_args=extra_compile_args, # 可选的编译参数
-            extra_link_args=extra_link_args,
+    name=PACKAGE_NAME,
+    version="0.1.0",
+    packages=find_packages(
+        exclude=(
+            "build",
+            "csrc",
+            "third_party",
+            "tmp",
         )
+    ),
+    description="My Toy HGEMM implement by CUDA",
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": BuildExtension},
+    python_requires=">=3.10",
+    install_requires=[
+        "torch",
+        "packaging",
+        "ninja",
     ],
-    cmdclass={
-        'build_ext': BuildExtension
-    }
 )

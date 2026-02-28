@@ -1,0 +1,18 @@
+cat > .gitignore << EOF
+# 编译产物
+build/
+*.so
+*.o
+*.a
+build.log
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# CUDA编译产物
+*.cuo
+*.ptx
+*.fatbin
