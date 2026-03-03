@@ -18,8 +18,11 @@ def get_device_capability():
 
 def get_build_sources():
     build_sources = [
-        "csrc/hgemm/hgemm_mma_ptx.cu",
-        "csrc/hgemm/hgemm_mma_stage_tn_cute.cu",
+        # "csrc/hgemm/hgemm_mma_ptx.cu",
+        # "csrc/hgemm/hgemm_mma_stage_tn_cute.cu",
+        # "csrc/warp_shf.cu",
+        # "csrc/softmax_.cu",
+        "csrc/softmax.cu",
         "csrc/common_extension.cc",
     ]
     return build_sources

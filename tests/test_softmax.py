@@ -15,7 +15,9 @@ if __name__ == "__main__":
             
             for i in range(run_tims):
                 toy_hgemm.online_softmax(x, y)
+                # print(y)
 
             for i in range(run_tims):
                 baseline = torch.softmax(x, dim=-1)
+                # print(baseline)
 
