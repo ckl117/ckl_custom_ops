@@ -16,3 +16,6 @@ __pycache__/
 *.cuo
 *.ptx
 *.fatbin
+
+# profile
+*.ncu-rep
