@@ -6,25 +6,26 @@
 #include <float.h>
 #include <cub/cub.cuh>
 
-struct __align__(8) mMD {
+struct __align__(8) MD{
   float m;
   float d;
 };
 
-__device__ __forceinline__ mMD reduce_md(mMD a, mMD b){
+__device__ __forceinline__ MD reduce_md(MD a, MD b){
+  MD result;
   bool a_bigger = a.m > b.m;
-  mMD bigger = a_bigger ? a : b;
-  mMD smaller = a_bigger ? b : a;
-  mMD res;
-  res.m = bigger.m;
-  res.d = bigger.d + smaller.d * __expf(smaller.m - bigger.m);
-  return res;
+  MD bigger = a_bigger ? a : b;
+  MD smaller = a_bigger ? b : a;
+  result.m = bigger.m;
+  result.d = bigger.d + smaller.d * __expf(smaller.m - bigger.m);
+  return result;
 }
-template<const int kWarpSize=32>
-__device__ __forceinline__ mMD warp_reduce_md(mMD val){
-# pragma unroll
-  for(int mask = kWarpSize >> 1; mask >= 1; mask >>= 1){
-    mMD other;
+
+template <int warpSize>
+__device__ __forceinline__ MD warp_redcue_max(MD val){
+#pragma unroll
+  for(int mask = warpSize >> 1; mask >= 1; mask >>=1){
+    MD other;
     other.m = __shfl_xor_sync(0xffffffff, val.m, mask);
     other.d = __shfl_xor_sync(0xffffffff, val.d, mask);
     val = reduce_md(val, other);
@@ -32,56 +33,51 @@ __device__ __forceinline__ mMD warp_reduce_md(mMD val){
   return val;
 }
 
-template<const int NUM_THREADS=128>
-__global__ void online_softmax_kernel(const float* x, float* y, const int cols){
+template <int blockSize>
+__global__ void online_softmax_kernel(const float* x, float*y, const int N){
+  // m_i = max(m_i-1, x_i)
+  // d_i = d_i-1 * exp(m_i-1 - m_i) + exp(x_i-m_i)
   const int tid = threadIdx.x;
-  // init m_0 = x_i, d_0 = 1.0
-  // m_i = max(m_(i-1), x_i)
-  // d_i = d_(i-1)*exp(m_(i-1) - m_i) + exp(x_i - m_i)
-
-  __shared__ mMD md_shared[32];
   const int warp_id = tid / 32;
-  const int warp_lane = tid % 32;
-  const int NUM_WARPS = NUM_THREADS / 32;
-  if (warp_id == 0){
-    md_shared[warp_lane].m = -FLT_MAX;
-    md_shared[warp_lane].d = 0.0;
+  const int lane_id = tid % 32;
+  constexpr int NUM_WARPS = blockSize / 32;
+
+  const float* x_base = x + blockIdx.x * N;
+  float* y_base = y + blockIdx.x * N;
+
+  __shared__ MD shared_md[NUM_WARPS];
+
+  MD patital;
+  patital.m = -FLT_MAX;
+  patital.d = 0.0f;
+  // 每个thread 做一行
+  for(int i = tid; i < N; i += blockSize){
+    MD val;
+    val.m = x_base[i];
+    val.d = 1.0f;
+    patital = reduce_md(patital, val);
+  }
+
+  // warp 内reduce
+  MD reduce_res = warp_redcue_max<32>(patital);
+  if(lane_id == 0){
+    shared_md[warp_id] = reduce_res;
   }
   __syncthreads();
+  // block 内
+  MD res;
+  res = lane_id < NUM_WARPS ? shared_md[lane_id] : MD{-FLT_MAX, 0.0f};
+  res = warp_redcue_max<NUM_WARPS>(res);
+  res.m = __shfl_sync(0xffffffff, res.m, 0);
+  res.d = __shfl_sync(0xffffffff, res.d, 0);
 
-  const float* x_base_ptr = x + blockIdx.x * cols;
-  float* y_base_ptr = y + blockIdx.x * cols;
+  // 写回
+  float max_val = res.m;
+  float d_inv = 1.0f / res.d;
+  for(int i = tid; i < N; i += blockSize){
+    y_base[i] = d_inv * __expf(x_base[i] - max_val);
+  }
 
-  mMD md_partial;
-  md_partial.m = -FLT_MAX;
-  md_partial.d = 0.0;
-  for(int i = tid; i < cols; i += NUM_THREADS){
-    mMD md_new;
-    md_new.m = x_base_ptr[i];
-    md_new.d = 1.0;
-    md_partial = reduce_md(md_partial, md_new);
-  }
-  mMD res;
-  res = warp_reduce_md(md_partial);
-  if (warp_lane == 0){
-    md_shared[warp_id] = res;
-  }
-  __syncthreads();
-  // Do block reduce
-  if (tid < 32){
-    mMD block_res = md_shared[tid];
-    block_res = warp_reduce_md<NUM_WARPS>(block_res);
-    if (tid == 0){
-      md_shared[0] = block_res;
-    }
-  }
-  __syncthreads();
-
-  float d_inv = __fdividef(1.0, md_shared[0].d);
-  float max_val = md_shared[0].m;
-  for(int i = tid; i < cols; i += NUM_THREADS){
-    y_base_ptr[i] = __expf(x_base_ptr[i] - max_val) * d_inv;
-  }
 }
 
 void online_softmax(torch::Tensor x, torch::Tensor y){
