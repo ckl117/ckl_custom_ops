@@ -42,7 +42,7 @@ Sglang推理框架
 3. 根据请求类型dispatch到不同方法
    1. 生成请求会在这里设置好后处理参数，包括max_tokens
    2. 加入到waiting队列
-      1. _prefetch_kvcache。多级缓存：req.init_next_round_input(tree_cache) 初始化请求，计算prefix cache长度，包括输出token
+      1. `_prefetch_kvcache`。多级缓存：req.init_next_round_input(tree_cache) 初始化请求，计算prefix cache长度，包括输出token
       2. 加入到waiting队列
 4. get_next_batch_to_run：获取下一个需要推理的batch
    1. 去除waiting、running队列中的超时请求
@@ -80,4 +80,157 @@ pre_and_run = recv_requests + process_input_requests + get_next_batch_to_run
 CPU: [pre_and_run N]      -> [pop_and_process N-1] -> [pre_and_run N+1]             -> [pop_and_process N]
                     ↓                                                            ↑
 GPU:                 [                   run_batch N                    ]   ->   d2h(async)
+```
+
+## PD分离
+
+### 一、初始化
+scheduler通过`init_disaggregation()`完成prefill和decode节点的初始化。
+
+| 模式 | 创建的队列 | 作用 |
+   | --- | --- | --- |
+| DECODE | disagg_decode_prealloc_queue (DecodePreallocQueue) | 握手 + 预分配 KV 内存 |
+| DECODE | disagg_decode_transfer_queue (DecodeTransferQueue) | 轮询 KV 传输状态 |
+| PREFILL | disagg_prefill_bootstrap_queue (PrefillBootstrapQueue) | 与 Decode 端握手 |
+| PREFILL | disagg_prefill_inflight_queue (List[Req]) | 正在发送 KV 的请求 |
+
+两端都会创建 MetadataBuffers(传输首 token、logprobs、hidden states 等元数据) 和 ReqToMetadataIdxAllocator (元数据 buffer 索引分配器)。其中P的`buffer_size`由总token数//context_len确定， D为最大并发*2
+
+
+prefill:  
+1. BootstrapServer <- start_disagg_service <- init_tokenizer_manager(): 启动aiohttp(/route、/health)，注册P信息，让D发现自己的dp/cp/tp/pp等拓扑
+```shell
+┌─────────────────────────────────────────────────────────────────────┐
+│  CommonKVBootstrapServer (aiohttp, 运行在 Prefill 端)                │
+│                                                                     │
+│  PUT  /route               ← Prefill rank 注册自己                   │
+│  GET  /route               ← Decode 端查询 Prefill 拓扑/连接地址       │
+│  POST /register_dp_rank    ← Prefill 注册 bootstrap_room→dp_rank     │
+│  POST /query_dp_ranks      ← Decode 批量查询 room→dp_rank 映射        │
+│  GET  /health              ← 健康检查                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 二、请求路由 _add_request_to_queue
+```python
+def _add_request_to_queue(self, req, is_retracted=False):
+    if mode == NULL:       → self.waiting_queue.append(req)        # 正常模式
+    elif mode == PREFILL:  → self.disagg_prefill_bootstrap_queue.add(req, ...)  # Prefill 模式
+    elif mode == DECODE:   → self.disagg_decode_prealloc_queue.add(req, ...)    # Decode 模式
+
+```
+### 三、事件分发 dispatch_event_loop
+|Mode | Normal | Overlap | Pipeline Parallel |
+| --- | --- | --- | --- |
+| PREFILL | event_loop_normal_disagg_prefill | event_loop_overlap_disagg_prefill | event_loop_pp_disagg_prefill |
+| DECODE | event_loop_normal_disagg_decode | event_loop_overlap_disagg_decode | event_loop_pp_disagg_decode |
+
+#### 四、生命周期
+##### P
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. PrefillBootstrapQueue                                            │
+│     请求到达 → 创建 KVSender → 与 Decode 端握手                       │
+│     poll 状态: Bootstrapping → WaitingForInput                       │
+│                                                                      │
+│  2. waiting_queue                                                    │
+│     握手完成 → pop_bootstrapped() → 进入 waiting_queue                │
+│     由 PrefillAdder 调度执行 prefill forward                          │
+│                                                                      │
+│  3. disagg_prefill_inflight_queue                                    │
+│     forward 完成 → send_kv_chunk():                                   │
+│       - 获取 KV page indices                                         │
+│       - 写入首 token/logprobs/hidden_states 到 MetadataBuffers        │
+│       - 调用 sender.send(page_indices, state_indices) 发起 RDMA 传输  │
+│     poll 状态: WaitingForInput → Transferring → Success               │
+│     Success → 释放 KV Cache, 返回结果给用户                           │
+└──────────────────────────────────────────────────────────────────────┘
+```
+后台线程：
+一个prefill线程: 负责与D握手. KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+多个传输进程: 一个线程池和多个传输队列`transfer_queue_size`，线程池划分成`transfer_queue_size`个子线程池，负责每个队列传输.
+握手(poll)信息: mooncake_session_id、kv cache 大小
+
+1. recv_requests(). 同集中式
+2. process_input_requests(). 同集中式，包含(`_add_request_to_queue`)
+3. waiting_queue.append(disagg_prefill_bootstrap_queue.pop_bootstrapped()). 完成握手
+
+##### 整体时序图
+```shell
+    Prefill 端                    Bootstrap Server (HTTP)               Decode 端
+    ──────────                    ────────────────────────               ──────────
+         │                                │                                  │
+  ───────┼── 阶段 0: 服务注册 ────────────┼──────────────────────────────────┼────
+         │                                │                                  │
+    (启动时) PUT /route ─────────────────→│                                  │
+         │  {tp_rank, cp_rank, pp_rank,   │                                  │
+         │   rank_ip, rank_port, ...}     │                                  │
+         │                                │                                  │
+         │                                │←──── GET /route (全局拓扑) ──────│ (启动时)
+         │                                │──────→ PrefillServerInfo ────────→│
+         │                                │        {tp_size, cp_size, ...}   │
+         │                                │                                  │
+         │                                │     _resolve_rank_mapping()      │
+         │                                │     计算 TP/CP/PP rank 对应关系  │
+         │                                │                                  │
+  ───────┼── 阶段 1: 请求到达 ────────────┼──────────────────────────────────┼────
+         │                                │                                  │
+    创建 KVSender                         │                            创建 KVReceiver
+    状态 → Bootstrapping                  │                            状态 → Bootstrapping
+         │                                │                                  │
+         │                                │←── GET /route (具体 rank) ───────│
+         │                                │    ?prefill_dp_rank=X&           │
+         │                                │     target_tp_rank=Y&pp_rank=Z   │
+         │                                │───→ PrefillRankInfo ────────────→│
+         │                                │     {rank_ip, rank_port}         │
+         │                                │                                  │
+  ───────┼── 阶段 2: KV Args 注册 ───────┼──────────────────────────────────┼────
+         │                                │                                  │
+         │←─── ZMQ PUSH (room="None") ──────────────────────────────────────│
+         │     {session_id, kv_data_ptrs, │                          _register_kv_args()
+         │      aux_data_ptrs, tp_rank,   │                                  │
+         │      kv_item_len, ...}         │                                  │
+         │                                │                            状态 → WaitingForInput
+    Prefill bootstrap_thread 收到后       │                                  │
+    存入 decode_kv_args_table             │                                  │
+         │                                │                                  │
+  ───────┼── 阶段 3: KV 内存预分配 + 地址交换 ─────────────────────────────┼────
+         │                                │                                  │
+         │                                │                       DecodePreallocQueue:
+         │                                │                         _pre_alloc() 预分配 KV 内存
+         │                                │                         获取 kv_page_indices
+         │                                │                                  │
+         │←─── ZMQ PUSH (room=实际ID) ─────────────────────────────────────│
+         │     {bootstrap_room, endpoint, │                          receiver.init(
+         │      session_id, dst_kv_indices,│                            kv_indices,
+         │      dst_aux_index,            │                            aux_index,
+         │      dst_state_indices,        │                            state_indices)
+         │      required_dst_info_num}    │                                  │
+         │                                │                            状态 → Transferring (等待)
+    bootstrap_thread 收到后               │                                  │
+    存入 transfer_infos[room]             │                                  │
+    当所有 dst_info 到齐后               │                                  │
+    状态 → WaitingForInput                │                                  │
+         │                                │                                  │
+  ───────┼── 阶段 4: KV 数据 RDMA 传输 ──┼──────────────────────────────────┼────
+         │                                │                                  │
+    Scheduler 执行 prefill forward        │                                  │
+    send_kv_chunk() →                     │                                  │
+    add_transfer_request() →              │                                  │
+    transfer_worker 线程:                 │                                  │
+      engine.batch_transfer_sync()        │                                  │
+      (RDMA one-sided write) ══════════════════════════════════════════════→ GPU 内存
+         │                                │                                  │
+    最后一个 chunk:                       │                                  │
+      send_aux() (元数据传输)             │                                  │
+      sync_status_to_decode_endpoint()    │                                  │
+         │                                │                                  │
+         │──── ZMQ PUSH {room, Success, rank} ─────────────────────────────→│
+         │                                │                          decode_thread 收到后
+    状态 → Success                        │                          状态 → Success
+         │                                │                                  │
+    释放 KV Cache                         │                       _commit_transfer_to_req()
+                                                                   读取 MetadataBuffers
+                                                                   进入 waiting_queue → 解码
+
 ```
